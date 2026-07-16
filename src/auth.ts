@@ -1,6 +1,16 @@
 import type { AccountInfo, Configuration, ICachePlugin, TokenCacheContext } from '@azure/msal-node';
-import { AuthError, PublicClientApplication } from '@azure/msal-node';
+import {
+  AuthError,
+  ConfidentialClientApplication,
+  PublicClientApplication,
+} from '@azure/msal-node';
 import logger from './logger.js';
+import {
+  getRefreshTokenFilePath,
+  getRefreshTokenFileScopes,
+  readRefreshTokenFile,
+  writeRefreshTokenFile,
+} from './refresh-token-file.js';
 import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import path from 'path';
@@ -51,6 +61,9 @@ function createMsalConfig(secrets: AppSecrets): Configuration {
     auth: {
       clientId: secrets.clientId || getDefaultClientId(secrets.cloudType),
       authority: `${cloudEndpoints.authority}/${secrets.tenantId || 'common'}`,
+      // Carried through (ignored by PublicClientApplication) so refresh-token-file
+      // mode can build a ConfidentialClientApplication for confidential refresh.
+      clientSecret: secrets.clientSecret,
     },
   };
 }
@@ -598,6 +611,9 @@ class AuthManager {
   private tokenExpiry: number | null;
   private oauthToken: string | null;
   private isOAuthMode: boolean;
+  private refreshTokenFilePath: string | null;
+  private refreshCca: ConfidentialClientApplication | null;
+  private lastRefreshToken: string | null;
   private selectedAccountId: string | null;
   private useInteractiveAuth: boolean;
   private expectedUsername: string | null;
@@ -635,6 +651,115 @@ class AuthManager {
     const oauthTokenFromEnv = process.env.MS365_MCP_OAUTH_TOKEN;
     this.oauthToken = oauthTokenFromEnv ?? null;
     this.isOAuthMode = oauthTokenFromEnv != null;
+
+    // FellowHire fork: refresh-token-file mode. Authenticate from a minted
+    // delegated refresh token on disk and self-refresh via a confidential
+    // client, rewriting the rotated token back to the file.
+    this.refreshTokenFilePath = getRefreshTokenFilePath();
+    this.refreshCca = null;
+    this.lastRefreshToken = null;
+    if (this.refreshTokenFilePath && !this.isOAuthMode) {
+      const clientSecret = this.config.auth.clientSecret;
+      if (!clientSecret) {
+        throw new Error(
+          'MS365_MCP_REFRESH_TOKEN_FILE requires MS365_MCP_CLIENT_SECRET (confidential client) to refresh tokens.'
+        );
+      }
+      this.refreshCca = new ConfidentialClientApplication({
+        auth: {
+          clientId: this.config.auth.clientId,
+          authority: this.config.auth.authority,
+          clientSecret,
+        },
+      });
+      logger.info('Refresh-token-file mode enabled (confidential client, self-refreshing).');
+    }
+  }
+
+  private isRefreshTokenFileMode(): boolean {
+    return this.refreshCca !== null && this.refreshTokenFilePath !== null;
+  }
+
+  /**
+   * FellowHire fork: acquire a Graph access token by redeeming the refresh
+   * token from disk (confidential client), caching the access token in memory,
+   * and persisting any rotated refresh token back to the file.
+   */
+  private async refreshFromFile(forceRefresh = false): Promise<string> {
+    // Reuse the cached access token until a minute before expiry.
+    if (
+      this.accessToken &&
+      this.tokenExpiry &&
+      this.tokenExpiry > Date.now() + 60_000 &&
+      !forceRefresh
+    ) {
+      return this.accessToken;
+    }
+
+    const filePath = this.refreshTokenFilePath as string;
+    const refreshToken = (await readRefreshTokenFile(filePath)) ?? this.lastRefreshToken;
+    if (!refreshToken) {
+      throw new Error(
+        `No Microsoft refresh token found at ${filePath}. The FellowHire Orchestrator must provision one.`
+      );
+    }
+
+    const scopes = getRefreshTokenFileScopes() ?? this.scopes;
+
+    let response;
+    try {
+      response = await (
+        this.refreshCca as ConfidentialClientApplication
+      ).acquireTokenByRefreshToken({
+        refreshToken,
+        scopes,
+        forceCache: true,
+      });
+    } catch (error) {
+      logger.error(`Refresh-token-file refresh failed: ${describeAuthError(error)}`);
+      throw new Error(
+        `Failed to refresh the Microsoft token from ${filePath}: ${(error as Error).message}`
+      );
+    }
+
+    if (!response || !response.accessToken) {
+      throw new Error('Refresh-token-file refresh returned no access token.');
+    }
+
+    this.accessToken = response.accessToken;
+    this.tokenExpiry = response.expiresOn ? new Date(response.expiresOn).getTime() : null;
+    this.lastRefreshToken = refreshToken;
+
+    await this.persistRotatedRefreshToken(filePath, refreshToken);
+
+    return this.accessToken;
+  }
+
+  /**
+   * Microsoft rotates the refresh token on redemption. Extract the newest one
+   * from the confidential client's cache and rewrite the file so the
+   * Orchestrator's hourly mirror pulls it back before the old one lapses.
+   */
+  private async persistRotatedRefreshToken(filePath: string, previousToken: string): Promise<void> {
+    try {
+      const serialized = (this.refreshCca as ConfidentialClientApplication)
+        .getTokenCache()
+        .serialize();
+      const parsed = JSON.parse(serialized) as {
+        RefreshToken?: Record<string, { secret?: string }>;
+      };
+      const rotated = Object.values(parsed.RefreshToken ?? {})
+        .map((entry) => entry?.secret)
+        .find((secret): secret is string => typeof secret === 'string' && secret.length > 0);
+
+      if (rotated && rotated !== previousToken) {
+        await writeRefreshTokenFile(filePath, rotated);
+        this.lastRefreshToken = rotated;
+        logger.info('Rotated Microsoft refresh token persisted to file.');
+      }
+    } catch (error) {
+      logger.warn(`Could not persist rotated refresh token: ${(error as Error).message}`);
+    }
   }
 
   /**
@@ -858,6 +983,10 @@ class AuthManager {
   async getToken(forceRefresh = false): Promise<string | null> {
     if (this.isOAuthMode && this.oauthToken) {
       return this.oauthToken;
+    }
+
+    if (this.isRefreshTokenFileMode()) {
+      return this.refreshFromFile(forceRefresh);
     }
 
     if (this.accessToken && this.tokenExpiry && this.tokenExpiry > Date.now() && !forceRefresh) {
@@ -1211,6 +1340,16 @@ class AuthManager {
    * @returns The access token string.
    */
   async getTokenForAccount(identifier?: string): Promise<string> {
+    if (this.isRefreshTokenFileMode()) {
+      if (identifier) {
+        throw new Error(
+          `Cannot switch to account '${identifier}': the server is in refresh-token-file mode and ` +
+            `always uses the mailbox that consented. Account switching requires interactive login.`
+        );
+      }
+      return this.refreshFromFile();
+    }
+
     if (this.isOAuthMode && this.oauthToken) {
       // Refuse instead of silently returning the bearer's identity (discussion #467):
       // in OAuth mode the token comes from the connecting client and cannot be
