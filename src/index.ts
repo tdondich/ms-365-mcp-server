@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import 'dotenv/config';
+import './load-env.js';
 import { parseArgs } from './cli.js';
 import logger from './logger.js';
 import AuthManager, { buildAllowedScopeDiagnostics, resolveAuthScopes } from './auth.js';
