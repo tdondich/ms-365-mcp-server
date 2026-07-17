@@ -681,6 +681,15 @@ class AuthManager {
   }
 
   /**
+   * FellowHire fork: whether the server's identity is pinned to an on-disk
+   * refresh token. In this mode interactive auth must not be offered — a
+   * completed login/device-code flow would re-bind the mailbox identity.
+   */
+  isRefreshTokenFileModeEnabled(): boolean {
+    return this.isRefreshTokenFileMode();
+  }
+
+  /**
    * FellowHire fork: acquire a Graph access token by redeeming the refresh
    * token from disk (confidential client), caching the access token in memory,
    * and persisting any rotated refresh token back to the file.
@@ -1162,13 +1171,26 @@ class AuthManager {
       try {
         const secrets = await getSecrets();
         const cloudEndpoints = getCloudEndpoints(secrets.cloudType);
-        const response = await fetch(`${cloudEndpoints.graphApi}/v1.0/me`, {
+        // FellowHire fork: /me needs the User.Read delegated scope, which the
+        // deliberately-narrow token-file consent bundle omits. Probe an
+        // endpoint the bundle does cover instead (Mail.ReadWrite).
+        const probePath = this.isRefreshTokenFileMode()
+          ? '/v1.0/me/mailFolders?$top=1'
+          : '/v1.0/me';
+        const response = await fetch(`${cloudEndpoints.graphApi}${probePath}`, {
           headers: {
             Authorization: `Bearer ${token}`,
           },
         });
 
         if (response.ok) {
+          if (this.isRefreshTokenFileMode()) {
+            logger.info('Graph API mailbox probe successful');
+            return {
+              success: true,
+              message: 'Login successful (mailbox reachable)',
+            };
+          }
           const userData = await response.json();
           logger.info('Graph API user data fetch successful');
           return {

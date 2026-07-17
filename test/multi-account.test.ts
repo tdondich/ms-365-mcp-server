@@ -80,6 +80,7 @@ describe('Multi-account support', () => {
     it('should not register list-accounts in registerGraphTools (canonical owner is auth-tools)', () => {
       const mockAuthManager = {
         isOAuthModeEnabled: vi.fn().mockReturnValue(false),
+        isRefreshTokenFileModeEnabled: vi.fn().mockReturnValue(false),
         getTokenForAccount: vi.fn(),
         listAccounts: vi.fn().mockResolvedValue([]),
         getSelectedAccountId: vi.fn().mockReturnValue(null),
@@ -103,6 +104,7 @@ describe('Multi-account support', () => {
     it('should register list-accounts exactly once when auth-tools + graph-tools both run', () => {
       const mockAuthManager = {
         isOAuthModeEnabled: vi.fn().mockReturnValue(false),
+        isRefreshTokenFileModeEnabled: vi.fn().mockReturnValue(false),
         getTokenForAccount: vi.fn(),
         listAccounts: vi.fn().mockResolvedValue([]),
         getSelectedAccountId: vi.fn().mockReturnValue(null),
@@ -147,6 +149,7 @@ describe('Multi-account support', () => {
         removeAccount: vi.fn(),
         hasExpectedAccount: vi.fn().mockReturnValue(false),
         isOAuthModeEnabled: vi.fn().mockReturnValue(false),
+        isRefreshTokenFileModeEnabled: vi.fn().mockReturnValue(false),
       };
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any -- handler type varies across McpServer.tool() overloads
@@ -198,6 +201,7 @@ describe('Multi-account support', () => {
         removeAccount: vi.fn(),
         hasExpectedAccount: vi.fn().mockReturnValue(true),
         isOAuthModeEnabled: vi.fn().mockReturnValue(false),
+        isRefreshTokenFileModeEnabled: vi.fn().mockReturnValue(false),
       };
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any -- handler type varies across McpServer.tool() overloads

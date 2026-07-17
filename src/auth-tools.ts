@@ -4,6 +4,21 @@ import AuthManager from './auth.js';
 import { getRequestTokens } from './request-context.js';
 
 export function registerAuthTools(server: McpServer, authManager: AuthManager): void {
+  // FellowHire fork: with the identity pinned to an on-disk refresh token,
+  // interactive auth and account mutation must not be exposed at all —
+  // whoever completes a login/device-code flow would re-bind the mailbox.
+  // Only verify-login and list-accounts (both read-only) stay registered.
+  const identityPinned = authManager.isRefreshTokenFileModeEnabled();
+
+  if (!identityPinned) {
+    registerInteractiveAuthTools(server, authManager);
+    registerAccountMutationTools(server, authManager);
+  }
+
+  registerReadOnlyAuthTools(server, authManager);
+}
+
+function registerInteractiveAuthTools(server: McpServer, authManager: AuthManager): void {
   server.tool(
     'login',
     'Authenticate with Microsoft account',
@@ -95,7 +110,9 @@ export function registerAuthTools(server: McpServer, authManager: AuthManager): 
       };
     }
   });
+}
 
+function registerReadOnlyAuthTools(server: McpServer, authManager: AuthManager): void {
   server.tool('verify-login', 'Check current Microsoft authentication status', {}, async () => {
     let testResult: Awaited<ReturnType<AuthManager['testLogin']>>;
     try {
@@ -171,7 +188,9 @@ export function registerAuthTools(server: McpServer, authManager: AuthManager): 
       }
     }
   );
+}
 
+function registerAccountMutationTools(server: McpServer, authManager: AuthManager): void {
   server.tool(
     'select-account',
     'Select a Microsoft account as the default. Accepts email address (e.g. user@outlook.com) or account ID. Use list-accounts to discover available accounts.',

@@ -89,6 +89,7 @@ describe('Discussion #467: account parameter in HTTP/OAuth mode', () => {
 
     const mockAuthManager = {
       isOAuthModeEnabled: vi.fn().mockReturnValue(false),
+      isRefreshTokenFileModeEnabled: vi.fn().mockReturnValue(false),
       getTokenForAccount: vi.fn().mockResolvedValue('msal-token'),
       getToken: vi.fn().mockResolvedValue(null),
       ...authManagerOverrides,
@@ -146,6 +147,7 @@ describe('Discussion #467: account parameter in HTTP/OAuth mode', () => {
     const byotToken = makeJwt({ upn: 'byot-user@domain.com' });
     const { fetchSpy } = setup({
       isOAuthModeEnabled: vi.fn().mockReturnValue(true),
+      isRefreshTokenFileModeEnabled: vi.fn().mockReturnValue(false),
       getToken: vi.fn().mockResolvedValue(byotToken),
     });
 
@@ -180,6 +182,7 @@ describe('Discussion #467: list-accounts tip in OAuth bearer mode', () => {
       getSelectedAccountId: vi.fn().mockReturnValue(null),
       hasExpectedAccount: vi.fn().mockReturnValue(false),
       isOAuthModeEnabled: vi.fn().mockReturnValue(true),
+      isRefreshTokenFileModeEnabled: vi.fn().mockReturnValue(false),
     };
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any

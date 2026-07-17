@@ -25,6 +25,7 @@ describe('Auth Tools', () => {
     testLogin: ReturnType<typeof vi.fn>;
     acquireTokenByDeviceCode: ReturnType<typeof vi.fn>;
     getUseInteractiveAuth: ReturnType<typeof vi.fn>;
+    isRefreshTokenFileModeEnabled: ReturnType<typeof vi.fn>;
     acquireTokenInteractive: ReturnType<typeof vi.fn>;
     hasExpectedAccount: ReturnType<typeof vi.fn>;
   };
@@ -50,11 +51,32 @@ describe('Auth Tools', () => {
       testLogin: vi.fn(),
       acquireTokenByDeviceCode: vi.fn(),
       getUseInteractiveAuth: vi.fn().mockReturnValue(false),
+      isRefreshTokenFileModeEnabled: vi.fn().mockReturnValue(false),
       acquireTokenInteractive: vi.fn().mockResolvedValue(undefined),
       hasExpectedAccount: vi.fn().mockReturnValue(false),
     };
 
     registerAuthTools(server, authManager);
+  });
+
+  describe('refresh-token-file (identity-pinned) mode', () => {
+    it('suppresses identity-mutating tools and keeps read-only ones', () => {
+      const pinnedServer = { tool: vi.fn() };
+      const pinnedAuthManager = {
+        ...authManager,
+        isRefreshTokenFileModeEnabled: vi.fn().mockReturnValue(true),
+      };
+
+      registerAuthTools(pinnedServer, pinnedAuthManager);
+
+      const registered = pinnedServer.tool.mock.calls.map((call) => call[0]);
+      expect(registered).toContain('verify-login');
+      expect(registered).toContain('list-accounts');
+      expect(registered).not.toContain('login');
+      expect(registered).not.toContain('logout');
+      expect(registered).not.toContain('select-account');
+      expect(registered).not.toContain('remove-account');
+    });
   });
 
   describe('login tool', () => {
