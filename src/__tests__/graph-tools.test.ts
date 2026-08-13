@@ -178,6 +178,75 @@ describe('graph-tools', () => {
     });
   });
 
+  // ---- 1b. OData params survive validation with or without the leading $ ----
+  //
+  // Regression for a silent, expensive failure. hack.ts strips `$` from generated
+  // parameter names, so the advertised schema key is `select`. The MCP SDK
+  // validates input with a Zod object, which DROPS unknown keys — while our own
+  // llmTips instruct the model to send `$select=...`. The model complied, Zod
+  // discarded it, Graph returned the full entity, and nothing errored.
+  //
+  // Observed in production 2026-08-11: list-mail-messages sent exactly the
+  // llmTip-recommended `$select` and came back with full HTML bodies, truncated
+  // at the client's 64,000-character ceiling.
+  describe('OData parameter aliasing ($select vs select)', () => {
+    it('registers BOTH the bare and $-prefixed key for every OData param', async () => {
+      mockEndpoints.push(makeEndpoint());
+      mockEndpointsJson = [makeConfig()];
+
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, createMockGraphClient([]) as any);
+
+      const schema = server.tools.get('test-tool')!.schema;
+      for (const name of ['select', 'filter', 'orderby', 'top', 'search', 'skip', 'count']) {
+        expect(schema, `bare "${name}" must be registered`).toHaveProperty(name);
+        expect(schema, `"$${name}" must ALSO be registered`).toHaveProperty(`$${name}`);
+      }
+    });
+
+    it('forwards $select to Graph when the model sends the $-prefixed form', async () => {
+      mockEndpoints.push(makeEndpoint());
+      mockEndpointsJson = [makeConfig()];
+
+      const graphClient = createMockGraphClient([
+        { content: [{ type: 'text', text: JSON.stringify({ value: [] }) }] },
+      ]);
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      await server.tools
+        .get('test-tool')!
+        .handler({ $select: 'id,subject,bodyPreview', $top: 10 });
+
+      const [url] = graphClient.graphRequest.mock.calls[0];
+      expect(url).toContain('$select=id,subject,bodyPreview');
+      expect(url).toContain('$top=10');
+    });
+
+    it('still forwards the bare form, and both spellings produce the same URL', async () => {
+      mockEndpoints.push(makeEndpoint());
+      mockEndpointsJson = [makeConfig()];
+
+      const graphClient = createMockGraphClient([
+        { content: [{ type: 'text', text: JSON.stringify({ value: [] }) }] },
+        { content: [{ type: 'text', text: JSON.stringify({ value: [] }) }] },
+      ]);
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+
+      const tool = server.tools.get('test-tool')!;
+      await tool.handler({ select: 'id,subject' });
+      await tool.handler({ $select: 'id,subject' });
+
+      const [first] = graphClient.graphRequest.mock.calls[0];
+      const [second] = graphClient.graphRequest.mock.calls[1];
+      expect(first).toBe(second);
+    });
+  });
+
   // ---- 2. fetchAllPages pagination ----
   describe('fetchAllPages pagination', () => {
     it('should follow @odata.nextLink and combine results', async () => {

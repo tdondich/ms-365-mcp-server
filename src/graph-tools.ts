@@ -85,6 +85,24 @@ function withApiVersionPrefix(description: string, config?: EndpointConfig): str
   return config?.apiVersion === 'beta' ? `[beta] ${description}` : description;
 }
 
+/**
+ * OData system query options this server forwards to Graph. Kept at module scope
+ * because two places depend on the same list: the tool schema (which registers
+ * both `select` and `$select`) and the request builder (which normalizes them
+ * back to the `$`-prefixed form Graph expects).
+ */
+export const ODATA_PARAM_NAMES = [
+  'filter',
+  'select',
+  'expand',
+  'orderby',
+  'skip',
+  'top',
+  'count',
+  'search',
+  'format',
+] as const;
+
 /** When set to a positive integer, caps Graph `$top` on list requests (see README). */
 function maxTopFromEnv(): number | undefined {
   const raw = process.env.MS365_MCP_MAX_TOP;
@@ -747,17 +765,7 @@ async function executeGraphTool(
 
       // Ok, so, MCP clients (such as claude code) doesn't support $ in parameter names,
       // and others might not support __, so we strip them in hack.ts and restore them here
-      const odataParams = [
-        'filter',
-        'select',
-        'expand',
-        'orderby',
-        'skip',
-        'top',
-        'count',
-        'search',
-        'format',
-      ];
+      const odataParams = ODATA_PARAM_NAMES as readonly string[];
       // Handle both "top" and "$top" formats - strip $ if present, then re-add it
       const normalizedParamName = paramName.startsWith('$') ? paramName.slice(1) : paramName;
       const isOdataParam = odataParams.includes(normalizedParamName.toLowerCase());
@@ -1320,6 +1328,32 @@ export function registerGraphTools(
           'Set true to enable advanced query mode (ConsistencyLevel: eventual). Required for complex $filter on flag/flagStatus or contains().'
         )
         .optional();
+    }
+
+    // Accept every OData param with AND without the leading `$`.
+    //
+    // MUST run after the description overrides above: those pick whichever single
+    // key exists and rewrite it, so mirroring earlier would leave the other
+    // spelling holding the original, description-less schema.
+    //
+    // Why this is needed at all: hack.ts strips `$` from generated parameter
+    // names, so the advertised key is `select`. The MCP SDK validates input with a
+    // Zod object, which DROPS unknown keys — while our own llmTips instruct the
+    // model to send `$select=...`. The model complied, Zod discarded it, Graph
+    // returned the full entity, and nothing errored.
+    //
+    // Measured 2026-08-11: list-mail-messages sent exactly the llmTip-recommended
+    // `$select` and came back with full HTML bodies, truncated at the client's
+    // 64,000-character ceiling. `$top` was dropped the same way — the 10 items
+    // returned were Graph's default page size, not the requested value.
+    //
+    // executeGraphTool already normalizes `$select` -> `select` when building the
+    // URL (ODATA_PARAM_NAMES), so both spellings converge on one request.
+    for (const odataName of ODATA_PARAM_NAMES) {
+      const canonical = paramSchema[`$${odataName}`] ?? paramSchema[odataName];
+      if (!canonical) continue;
+      paramSchema[odataName] = canonical;
+      paramSchema[`$${odataName}`] = canonical;
     }
 
     // Add account parameter for multi-account mode.

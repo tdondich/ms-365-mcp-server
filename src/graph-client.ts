@@ -212,6 +212,18 @@ class GraphClient {
     );
   }
 
+  /**
+   * Serialize a Graph payload for the model.
+   *
+   * Compact, always. Indentation is display sugar for a human reading a
+   * terminal; every byte of it is paid for on the model's context and again on
+   * every subsequent turn the result stays resident. Callers previously passed
+   * pretty=true on the two main response paths.
+   *
+   * Output must also be DETERMINISTIC — the same request producing byte-identical
+   * text — because tool results become part of a cached prompt prefix. A response
+   * that varies run-to-run invalidates the cache and is billed at write price.
+   */
   private serializeData(data: unknown, outputFormat: 'json' | 'toon', pretty = false): string {
     if (outputFormat === 'toon') {
       try {
@@ -323,7 +335,7 @@ class GraphClient {
 
       return {
         content: [
-          { type: 'text', text: this.serializeData(responseData.data, outputFormat, true) },
+          { type: 'text', text: this.serializeData(responseData.data, outputFormat) },
         ],
         _meta: meta,
       };
@@ -362,7 +374,7 @@ class GraphClient {
     removeODataProps(data as Record<string, unknown>);
 
     return {
-      content: [{ type: 'text', text: this.serializeData(data, outputFormat, true) }],
+      content: [{ type: 'text', text: this.serializeData(data, outputFormat) }],
     };
   }
 }
