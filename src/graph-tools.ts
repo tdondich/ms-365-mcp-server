@@ -129,6 +129,76 @@ function clampTopQueryParam(queryParams: Record<string, string>): void {
 const DEFAULT_MAX_PAGES = 100;
 const DEFAULT_MAX_ITEMS = 10_000;
 
+// download-to-file: where saved downloads go, and how they are named.
+//
+// The directory comes from the environment the launcher was given
+// (MS365_MCP_DOWNLOAD_DIR first, then GANTRY_DOWNLOAD_DIR, which gantry sets to
+// the fellow's workspace downloads directory); with neither set the tool
+// refuses rather than guessing a path. Names are reduced to a safe base name
+// and never overwrite an existing file.
+const MAX_DOWNLOAD_TO_FILE_BYTES = 100 * 1024 * 1024;
+
+export function downloadDirectory(): string | undefined {
+  const dir = process.env.MS365_MCP_DOWNLOAD_DIR || process.env.GANTRY_DOWNLOAD_DIR;
+  return dir && dir.trim() !== '' ? dir : undefined;
+}
+
+const EXTENSION_BY_CONTENT_TYPE: Record<string, string> = {
+  'application/pdf': '.pdf',
+  'image/png': '.png',
+  'image/jpeg': '.jpg',
+  'image/gif': '.gif',
+  'image/webp': '.webp',
+  'text/plain': '.txt',
+  'text/csv': '.csv',
+  'application/msword': '.doc',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
+  'application/vnd.ms-excel': '.xls',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
+  'application/vnd.ms-powerpoint': '.ppt',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation': '.pptx',
+  'application/zip': '.zip',
+  'message/rfc822': '.eml',
+};
+
+export function safeDownloadName(requested: string | undefined, contentType: string): string {
+  const base = Array.from(path.basename((requested ?? '').trim()))
+    .filter((ch) => ch.charCodeAt(0) >= 32 && ch.charCodeAt(0) !== 127)
+    .join('');
+  let name = base.replace(/[\\/:*?"<>|]/g, '_').replace(/^\.+/, '');
+  if (name === '' || name === '.' || name === '..') {
+    const ext = EXTENSION_BY_CONTENT_TYPE[contentType.split(';')[0].trim().toLowerCase()] ?? '';
+    name = 'download' + ext;
+  }
+  return name.slice(0, 200);
+}
+
+async function saveDownload(
+  dir: string,
+  requested: string | undefined,
+  contentType: string,
+  bytes: Buffer
+): Promise<{ path: string; name: string }> {
+  const fs = await import('fs/promises');
+  await fs.mkdir(dir, { recursive: true });
+  const name = safeDownloadName(requested, contentType);
+  const ext = path.extname(name);
+  const stem = name.slice(0, name.length - ext.length);
+  for (let n = 0; n < 1000; n++) {
+    const candidate = n === 0 ? name : `${stem}-${n}${ext}`;
+    const full = path.join(dir, candidate);
+    try {
+      await fs.writeFile(full, bytes, { flag: 'wx', mode: 0o600 });
+      return { path: full, name: candidate };
+    } catch (error) {
+      if ((error as { code?: string }).code !== 'EEXIST') {
+        throw error;
+      }
+    }
+  }
+  throw new Error(`could not find a free name for ${name} in ${dir}`);
+}
+
 /** Reads a positive-integer env var, falling back to `defaultValue` when unset or invalid. */
 function positiveIntFromEnv(name: string, defaultValue: number): number {
   const raw = process.env[name];
@@ -401,6 +471,125 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
           content: [{ type: 'text', text: JSON.stringify({ error: (error as Error).message }) }],
           isError: true,
         };
+      }
+    },
+  },
+  {
+    name: 'download-to-file',
+    method: 'GET',
+    path: 'tool:download-to-file',
+    searchKeywords:
+      'save attachment save file download attachment to disk mail attachment file save email attachment write file workspace',
+    description:
+      'Download Microsoft Graph binary content and SAVE IT AS A FILE in your download directory, returning the path — never the bytes. Use this for a mail attachment (target /me/messages/{message-id}/attachments/{attachment-id}/$value; list-mail-attachments returns the ids), a drive file (/drives/{drive-id}/items/{driveItem-id}/content), or any other $value/content path, whenever you want the file itself rather than a preview: the file lands where your other tools (file_read, the PDF and document skills, send_file) can use it. Returns { path, bytes, contentType, name }. Refuses to overwrite: an existing name gets a numeric suffix. Prefer this over download-bytes for anything you intend to open, convert or send.',
+    readOnlyHint: true,
+    openWorldHint: true,
+    buildSchema: (ctx) => {
+      const schema: Record<string, z.ZodTypeAny> = {
+        target: z
+          .string()
+          .describe(
+            'Relative Microsoft Graph path starting with "/", e.g. ' +
+              '/me/messages/{message-id}/attachments/{attachment-id}/$value or ' +
+              '/drives/{drive-id}/items/{driveItem-id}/content.'
+          ),
+        name: z
+          .string()
+          .optional()
+          .describe(
+            'File name to save as (the attachment name from list-mail-attachments, e.g. "Deed.pdf"). ' +
+              'Only the base name is used; directories are not allowed. Defaults to "download" plus the extension the content type implies.'
+          ),
+      };
+      if (ctx.multiAccount) {
+        schema['account'] = z
+          .string()
+          .optional()
+          .describe(
+            'Account to use when multiple Microsoft accounts are configured. Required when multiple accounts exist (see list-accounts).'
+          );
+      }
+      return schema;
+    },
+    execute: async (params, { graphClient, authManager }) => {
+      const target = params.target;
+      const accountParam = params.account as string | undefined;
+      const fail = (error: string) => ({
+        content: [{ type: 'text' as const, text: JSON.stringify({ error }) }],
+        isError: true,
+      });
+      if (typeof target !== 'string' || !target.startsWith('/')) {
+        return fail(
+          'target is required and must be a relative Microsoft Graph path starting with "/".'
+        );
+      }
+      const dir = downloadDirectory();
+      if (!dir) {
+        return fail(
+          'No download directory is configured for this server (MS365_MCP_DOWNLOAD_DIR or GANTRY_DOWNLOAD_DIR), so files cannot be saved here. Use download-bytes for a small file, or report this gap.'
+        );
+      }
+      try {
+        const accountModeError = await checkAccountParamInBearerMode(accountParam, authManager);
+        if (accountModeError) {
+          return fail(accountModeError);
+        }
+        let accountAccessToken: string | undefined;
+        if (authManager && !authManager.isOAuthModeEnabled() && !getRequestTokens()) {
+          accountAccessToken = await authManager.getTokenForAccount(accountParam);
+        }
+        const response = await graphClient.graphRequest(target, {
+          accessToken: accountAccessToken,
+          rawResponse: true,
+        });
+        if (response.isError) {
+          return response;
+        }
+        const first = response.content?.[0];
+        const text = first && first.type === 'text' ? first.text : '';
+        let payload: { contentBytes?: string; contentType?: string; rawResponse?: string } = {};
+        try {
+          payload = JSON.parse(text);
+        } catch {
+          return fail('Graph returned a body this tool cannot save (not a binary response).');
+        }
+        let bytes: Buffer;
+        if (typeof payload.contentBytes === 'string') {
+          bytes = Buffer.from(payload.contentBytes, 'base64');
+        } else if (typeof payload.rawResponse === 'string') {
+          bytes = Buffer.from(payload.rawResponse, 'utf8');
+        } else {
+          return fail(
+            'Graph returned no file content for that path. For a mail attachment the path must end in /$value and name a fileAttachment (an itemAttachment or referenceAttachment has no bytes to save).'
+          );
+        }
+        if (bytes.byteLength > MAX_DOWNLOAD_TO_FILE_BYTES) {
+          return fail(
+            `The file is ${bytes.byteLength} bytes, over the ${MAX_DOWNLOAD_TO_FILE_BYTES}-byte cap for a saved download.`
+          );
+        }
+        const contentType = payload.contentType || 'application/octet-stream';
+        const saved = await saveDownload(
+          dir,
+          params.name as string | undefined,
+          contentType,
+          bytes
+        );
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                path: saved.path,
+                name: saved.name,
+                bytes: bytes.byteLength,
+                contentType,
+              }),
+            },
+          ],
+        };
+      } catch (error) {
+        return fail((error as Error).message);
       }
     },
   },

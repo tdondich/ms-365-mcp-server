@@ -216,9 +216,7 @@ describe('graph-tools', () => {
       const { registerGraphTools } = await loadModule();
       registerGraphTools(server as any, graphClient as any);
 
-      await server.tools
-        .get('test-tool')!
-        .handler({ $select: 'id,subject,bodyPreview', $top: 10 });
+      await server.tools.get('test-tool')!.handler({ $select: 'id,subject,bodyPreview', $top: 10 });
 
       const [url] = graphClient.graphRequest.mock.calls[0];
       expect(url).toContain('$select=id,subject,bodyPreview');
@@ -1015,6 +1013,82 @@ describe('graph-tools', () => {
       expect(result.isError).toBe(true);
       const payload = JSON.parse(result.content[0].text);
       expect(payload.error).toMatch(/relative Microsoft Graph path/);
+    });
+  });
+
+  // ---- 9a. download-to-file utility tool ----
+  describe('download-to-file', () => {
+    it('saves the bytes under the download directory and returns the path, never the bytes', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+      const os = await import('os');
+      const fs = await import('fs/promises');
+      const pathMod = await import('path');
+      const dir = await fs.mkdtemp(pathMod.join(os.tmpdir(), 'ms365-dl-'));
+      process.env.GANTRY_DOWNLOAD_DIR = dir;
+      delete process.env.MS365_MCP_DOWNLOAD_DIR;
+
+      const pdf = Buffer.from('%PDF-1.4 deed page one');
+      const graphClient = {
+        graphRequest: vi.fn().mockResolvedValue({
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                contentType: 'application/pdf',
+                encoding: 'base64',
+                contentLength: pdf.byteLength,
+                contentBytes: pdf.toString('base64'),
+              }),
+            },
+          ],
+        }),
+      };
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+      const tool = server.tools.get('download-to-file');
+      expect(tool).toBeDefined();
+
+      const first = await tool!.handler({
+        target: '/me/messages/m1/attachments/a1/$value',
+        name: '../../etc/Deed: 2026.pdf',
+      });
+      const out = JSON.parse(first.content[0].text);
+      expect(out.path).toBe(pathMod.join(dir, 'Deed_ 2026.pdf'));
+      expect(out.bytes).toBe(pdf.byteLength);
+      expect(out.contentType).toBe('application/pdf');
+      expect(first.content[0].text).not.toContain(pdf.toString('base64'));
+      expect((await fs.readFile(out.path)).equals(pdf)).toBe(true);
+      expect(graphClient.graphRequest.mock.calls[0][1].rawResponse).toBe(true);
+
+      // A second save under the same name does not overwrite the first.
+      const second = await tool!.handler({
+        target: '/me/messages/m1/attachments/a1/$value',
+        name: 'Deed_ 2026.pdf',
+      });
+      expect(JSON.parse(second.content[0].text).path).toBe(pathMod.join(dir, 'Deed_ 2026-1.pdf'));
+
+      // No name: one is derived from the content type.
+      const third = await tool!.handler({ target: '/me/messages/m1/attachments/a1/$value' });
+      expect(JSON.parse(third.content[0].text).name).toBe('download.pdf');
+    });
+
+    it('refuses when no download directory is configured', async () => {
+      mockEndpoints.length = 0;
+      mockEndpointsJson = [];
+      delete process.env.GANTRY_DOWNLOAD_DIR;
+      delete process.env.MS365_MCP_DOWNLOAD_DIR;
+      const graphClient = { graphRequest: vi.fn() };
+      const server = createMockServer();
+      const { registerGraphTools } = await loadModule();
+      registerGraphTools(server as any, graphClient as any);
+      const result = await server.tools
+        .get('download-to-file')!
+        .handler({ target: '/me/photo/$value' });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('download directory');
+      expect(graphClient.graphRequest).not.toHaveBeenCalled();
     });
   });
 
